@@ -80,40 +80,79 @@ type SchedulingThroughputFile struct {
 }
 
 // -----------------------------------------------------------------------------
-// Main Execution (Top Abstraction Level)
+// Main Execution
 // -----------------------------------------------------------------------------
 
 func main() {
-	buildID, artifactsDir := parseFlags()
+	opts := parseFlags()
 
-	runName := buildID
+	runName := opts.buildID
 	if !strings.HasPrefix(runName, "run-") {
-		runName = "run-" + buildID
+		runName = "run-" + opts.buildID
 	}
 
-	omDir := filepath.Join(artifactsDir, "openmetrics")
-	tsdbDir := filepath.Join(artifactsDir, "prometheus")
+	omDir := filepath.Join(opts.artifactsDir, "openmetrics")
+	tsdbDir := filepath.Join(opts.artifactsDir, "prometheus")
 
-	entries, err := ingestBuildMetrics(buildID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error ingesting metrics for build %s: %v\n", buildID, err)
-		os.Exit(1)
+	modeLower := strings.ToLower(opts.mode)
+
+	if modeLower == "slo" || modeLower == "all" {
+		entries, err := ingestBuildMetrics(opts.buildID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error ingesting SLO metrics for build %s: %v\n", opts.buildID, err)
+			if modeLower != "all" {
+				os.Exit(1)
+			}
+		} else {
+			_, err = generateOpenMetricsFile(runName, entries, omDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating OpenMetrics file: %v\n", err)
+				if modeLower != "all" {
+					os.Exit(1)
+				}
+			}
+
+			if err := createThanosTSDBBlock(tsdbDir, runName, entries); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating Thanos TSDB block: %v\n", err)
+				if modeLower != "all" {
+					os.Exit(1)
+				}
+			}
+		}
 	}
 
-	_, err = generateOpenMetricsFile(runName, entries, omDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error generating OpenMetrics file: %v\n", err)
+	if modeLower == "prometheus-metrics" || modeLower == "all" {
+		if err := ingestPrometheusSnapshot(opts.buildID, runName, tsdbDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning/Info: Prometheus snapshot ingestion for build %s: %v\n", opts.buildID, err)
+		}
+	}
+}
+
+type options struct {
+	buildID      string
+	mode         string
+	artifactsDir string
+}
+
+func parseFlags() options {
+	buildID := flag.String("build-id", "", "Prow Build ID or run identifier")
+	mode := flag.String("mode", "all", "Ingestion mode: slo-metrics, prometheus-metrics, or all")
+	artifactsDir := flag.String("artifacts-dir", "", "Root _artifacts directory")
+	flag.Parse()
+
+	if *buildID == "" || *artifactsDir == "" {
+		flag.Usage()
 		os.Exit(1)
 	}
-
-	if err := createThanosTSDBBlock(tsdbDir, runName, entries); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating Thanos TSDB block: %v\n", err)
-		os.Exit(1)
+	return options{
+		buildID:      *buildID,
+		mode:         *mode,
+		artifactsDir: *artifactsDir,
 	}
 }
 
 // -----------------------------------------------------------------------------
-// Mid-Level Workflow Operations
+// Metric Ingestion Operations
 // -----------------------------------------------------------------------------
 
 func ingestBuildMetrics(buildID string) ([]SLOEntry, error) {
@@ -304,6 +343,9 @@ func createThanosTSDBBlock(tsdbDir string, runName string, entries []SLOEntry) e
 	// Thanos Metadata Injection
 	blockDir := filepath.Join(tsdbDirAbs, blockULID.String())
 	thanosMeta := metadata.Thanos{
+		Labels: map[string]string{
+			"run": runName,
+		},
 		Source: metadata.SourceType("perflens-ingest"),
 	}
 
@@ -575,14 +617,163 @@ func fetchRawJSON(url string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func parseFlags() (string, string) {
-	buildID := flag.String("build-id", "", "Prow Build ID or run identifier")
-	artifactsDir := flag.String("artifacts-dir", "", "Root _artifacts directory")
-	flag.Parse()
+// ingestPrometheusSnapshot queries the GCS List API because Prometheus TSDB snapshot
+// block directories use dynamic 26-character ULID names (e.g. artifacts/prometheus/snapshots/<ulid>/).
+func ingestPrometheusSnapshot(buildID string, runName string, tsdbDir string) error {
+	rawBuildID := strings.TrimPrefix(buildID, "run-")
 
-	if *buildID == "" || *artifactsDir == "" {
-		flag.Usage()
-		os.Exit(1)
+	localRunDir := filepath.Join(filepath.Dir(tsdbDir), "runs", rawBuildID)
+	if _, err := os.Stat(localRunDir); os.IsNotExist(err) {
+		localRunDir = filepath.Join(filepath.Dir(tsdbDir), "runs", runName)
 	}
-	return *buildID, *artifactsDir
+
+	foundBlocks := 0
+	if _, err := os.Stat(localRunDir); err == nil {
+		err := filepath.Walk(localRunDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || !info.IsDir() {
+				return nil
+			}
+			metaPath := filepath.Join(path, "meta.json")
+			indexPath := filepath.Join(path, "index")
+			if _, e1 := os.Stat(metaPath); e1 == nil {
+				if _, e2 := os.Stat(indexPath); e2 == nil {
+					blockULID := filepath.Base(path)
+					targetDir := filepath.Join(tsdbDir, blockULID)
+
+					if err := copyDir(path, targetDir); err != nil {
+						return nil
+					}
+					if err := injectThanosRunLabel(targetDir, runName); err != nil {
+						fmt.Printf("Warning: Failed injecting Thanos metadata into %s: %v\n", blockULID, err)
+					}
+					foundBlocks++
+				}
+			}
+			return nil
+		})
+		if err == nil && foundBlocks > 0 {
+			fmt.Printf("Successfully ingested %d local Prometheus snapshot TSDB blocks for %s\n", foundBlocks, runName)
+			return nil
+		}
+	}
+
+	prefix := fmt.Sprintf("logs/ci-kubernetes-e2e-gce-scale-performance-5000/%s/artifacts/prometheus/snapshots/", rawBuildID)
+	xmlURL := fmt.Sprintf("https://storage.googleapis.com/kubernetes-ci-logs/?prefix=%s", prefix)
+
+	fmt.Printf("Downloading Prometheus snapshots from GCS for Build ID %s...\n", rawBuildID)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(xmlURL)
+	if err != nil {
+		return fmt.Errorf("fetching GCS snapshot list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("reading GCS snapshot response: %w", err)
+	}
+
+	var result ListBucketResult
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("parsing GCS snapshot XML: %w", err)
+	}
+
+	if len(result.Contents) == 0 {
+		return fmt.Errorf("no Prometheus snapshot files found on GCS for Build ID %s", rawBuildID)
+	}
+
+	downloadedBlocks := make(map[string]bool)
+
+	for _, content := range result.Contents {
+		key := content.Key
+		downloadURL := fmt.Sprintf("https://storage.googleapis.com/kubernetes-ci-logs/%s", key)
+		subPath := strings.TrimPrefix(key, prefix)
+		if subPath == "" {
+			continue
+		}
+
+		targetFile := filepath.Join(tsdbDir, subPath)
+		if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
+			return err
+		}
+
+		data, err := fetchRawJSON(downloadURL)
+		if err != nil {
+			fmt.Printf("Warning: Failed downloading %s: %v\n", downloadURL, err)
+			continue
+		}
+
+		if err := os.WriteFile(targetFile, data, 0644); err != nil {
+			return err
+		}
+
+		parts := strings.Split(subPath, string(os.PathSeparator))
+		if len(parts) > 0 {
+			blockULID := parts[0]
+			downloadedBlocks[blockULID] = true
+		}
+	}
+
+	for blockULID := range downloadedBlocks {
+		blockDir := filepath.Join(tsdbDir, blockULID)
+		metaPath := filepath.Join(blockDir, "meta.json")
+		if _, err := os.Stat(metaPath); err == nil {
+			if err := injectThanosRunLabel(blockDir, runName); err != nil {
+				fmt.Printf("Warning: Failed injecting Thanos metadata into block %s: %v\n", blockULID, err)
+			}
+		}
+	}
+
+	fmt.Printf("Successfully downloaded and ingested %d Prometheus snapshot blocks for %s from GCS\n", len(downloadedBlocks), runName)
+	return nil
+}
+
+func copyDir(src, dst string) error {
+	if src == dst {
+		return nil
+	}
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		targetPath := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, info.Mode())
+		}
+		return copyFile(path, targetPath)
+	})
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func injectThanosRunLabel(blockDir string, runName string) error {
+	thanosMeta := metadata.Thanos{
+		Labels: map[string]string{
+			"run": runName,
+		},
+		Source: metadata.SourceType("perflens-snapshot-ingest"),
+	}
+
+	oldLogger := nopLogger{}
+	_, err := metadata.InjectThanos(oldLogger, blockDir, thanosMeta, nil)
+	return err
 }
